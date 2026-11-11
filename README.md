@@ -67,7 +67,7 @@ it.
 
 ## Remove
 
-To remove the widget and its icon from your account, run:
+To remove the widget and its icon from your account, run in the project folder:
 
 ```sh
 ./uninstall.sh
@@ -77,6 +77,6 @@ This leaves palettes you previously applied and themes you installed unchanged.
 
 ## Notes
 
-Some wallpaper types, such as slideshows, do not provide an image that PCP can
+Some wallpaper types, such as slideshows, video and anymore do not provide an image that PCP can
 read. Theme descriptions shown in search results come from KDE Store and may be
 written in another language.
