@@ -13,12 +13,11 @@ The widget acts only when you press a button. It does not watch your wallpaper
 or send it anywhere. Internet access is used only when you search KDE Store.
 
 ## Install
-
-1. Download and unpack this project.
-2. Open a terminal in the `PlasmaColorPicker` folder.
-3. Run:
+Run:
 
    ```sh
+   git clone https://github.com/neverloseagain1/PlasmaColorPicker
+   cd PlasmaColorPicker
    ./install.sh
    ```
 
