@@ -14,11 +14,11 @@ PlasmaColorPicker — виджет для KDE Plasma 6. Он умеет:
 
 ## Установка
 
-1. Скачайте и распакуйте этот проект.
-2. Откройте терминал в папке `PlasmaColorPicker`.
-3. Запустите:
+Запустите:
 
    ```sh
+   git clone https://github.com/neverloseagain1/PlasmaColorPicker
+   cd PlasmaColorPicker
    ./install.sh
    ```
 
