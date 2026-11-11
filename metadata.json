@@ -1,0 +1,23 @@
+{
+    "KPlugin": {
+        "Id": "org.example.wallpaperpalette",
+        "Name": "PlasmaColorPicker (PCP)",
+        "Name[ru]": "PlasmaColorPicker (PCP)",
+        "Description": "Create wallpaper-based color schemes and find matching icon and cursor themes",
+        "Description[ru]": "Подбирает цветовые схемы по обоям и помогает находить темы значков и курсоров",
+        "Icon": "org.example.plasmacolorpicker",
+        "Version": "1.0.0 (Early Access)",
+        "Category": "Utilities",
+        "License": "MIT",
+        "Authors": [
+            {
+                "Name": "Never"
+            },
+            {
+                "Name": "Copilot (AI assistant)"
+            }
+        ]
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
