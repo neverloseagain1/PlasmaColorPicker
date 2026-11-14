@@ -1,5 +1,7 @@
 # PlasmaColorPicker (PCP) — Early Access
 
+<p align="center"><img src="pcp-logo-512.png" width="256" alt="PlasmaColorPicker logo"></p>
+
 [Русский](README.ru.md) | **English**
 
 PlasmaColorPicker is a widget for KDE Plasma 6. It can:
