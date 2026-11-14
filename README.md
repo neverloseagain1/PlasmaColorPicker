@@ -44,34 +44,36 @@ messages.
 
 ### Palettes
 
-<img align="right" width="360" src="pcp-side-1-palettes-en.png" alt="Color palettes generated from different wallpapers">
-
-On **Palettes**, choose **Analyze wallpaper**. PCP shows color suggestions and
-what each color is for. Select **Apply palette** to save and use one. PCP keeps
-the original Plasma theme unchanged and makes its own copy for the new colors.
-
-**Delete palettes** removes palettes made by PCP and restores the previous
-appearance.
+<table>
+<tr>
+<td width="55%" valign="top">
+<p>On <strong>Palettes</strong>, choose <strong>Analyze wallpaper</strong>. PCP shows color suggestions and what each color is for. Select <strong>Apply palette</strong> to save and use one. PCP keeps the original Plasma theme unchanged and makes its own copy for the new colors.</p>
+<p><strong>Delete palettes</strong> removes palettes made by PCP and restores the previous appearance.</p>
+</td>
+<td width="45%" valign="top"><img width="100%" src="pcp-side-1-palettes-en.png" alt="Color palettes generated from different wallpapers"></td>
+</tr>
+</table>
 
 ### Find and install themes
 
-<img align="left" width="360" src="pcp-side-2-themes-en.png" alt="Finding matching icon and cursor themes">
+<table>
+<tr>
+<td width="45%" valign="top"><img width="100%" src="pcp-side-2-themes-en.png" alt="Finding matching icon and cursor themes"></td>
+<td width="55%" valign="top">
+<p>On <strong>Icon themes</strong> or <strong>Cursor themes</strong>, choose a palette and select <strong>Find icons</strong> or <strong>Find cursors</strong>. Choose a result to open it in KDE Store.</p>
+</td>
+</tr>
+</table>
 
-On **Icon themes** or **Cursor themes**, choose a palette and select **Find
-icons** or **Find cursors**. Choose a result to open it in KDE Store.
-
-On **Install**, choose whether the archive contains icons or cursors. Drop the
-archive into the box or choose a file. PCP checks it and installs matching
-themes for your account. It does not replace an existing theme. If it cannot
-install an archive, it explains what to do next.
-
-To use an installed theme, open **System Settings → Colors & Themes → Icons**
-or **Cursors** and select it. If that page was already open, close and reopen
-it.
-
-<br clear="all">
-
-<p align="right"><img width="360" src="pcp-side-3-install-en.png" alt="Installing icon and cursor themes from an archive"></p>
+<table>
+<tr>
+<td width="55%" valign="top">
+<p>On <strong>Install</strong>, choose whether the archive contains icons or cursors. Drop the archive into the box or choose a file. PCP checks it and installs matching themes for your account. It does not replace an existing theme. If it cannot install an archive, it explains what to do next.</p>
+<p>To use an installed theme, open <strong>System Settings → Colors &amp; Themes → Icons</strong> or <strong>Cursors</strong> and select it. If that page was already open, close and reopen it.</p>
+</td>
+<td width="45%" valign="top"><img width="100%" src="pcp-side-3-install-en.png" alt="Installing icon and cursor themes from an archive"></td>
+</tr>
+</table>
 
 ## Remove
 
