@@ -1,4 +1,4 @@
-# PlasmaColorPicker (PCP) — Early Access
+<h1 align="center">PlasmaColorPicker (PCP) — Early Access</h1>
 
 <p align="center"><img src="pcp-logo-512.png" width="256" alt="PlasmaColorPicker logo"></p>
 
