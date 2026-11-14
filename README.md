@@ -44,6 +44,8 @@ messages.
 
 ### Palettes
 
+<img align="right" width="360" src="pcp-side-1-palettes-en.png" alt="Color palettes generated from different wallpapers">
+
 On **Palettes**, choose **Analyze wallpaper**. PCP shows color suggestions and
 what each color is for. Select **Apply palette** to save and use one. PCP keeps
 the original Plasma theme unchanged and makes its own copy for the new colors.
@@ -52,6 +54,8 @@ the original Plasma theme unchanged and makes its own copy for the new colors.
 appearance.
 
 ### Find and install themes
+
+<img align="left" width="360" src="pcp-side-2-themes-en.png" alt="Finding matching icon and cursor themes">
 
 On **Icon themes** or **Cursor themes**, choose a palette and select **Find
 icons** or **Find cursors**. Choose a result to open it in KDE Store.
@@ -64,6 +68,10 @@ install an archive, it explains what to do next.
 To use an installed theme, open **System Settings → Colors & Themes → Icons**
 or **Cursors** and select it. If that page was already open, close and reopen
 it.
+
+<br clear="all">
+
+<p align="right"><img width="360" src="pcp-side-3-install-en.png" alt="Installing icon and cursor themes from an archive"></p>
 
 ## Remove
 
