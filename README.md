@@ -1,4 +1,4 @@
-# PlasmaColorPicker (PCP) — Early Access
+<h1 align="center">PlasmaColorPicker (PCP) — Early Access</h1>
 
 <p align="center"><img src="contents/images/logo.png" width="256" alt="PlasmaColorPicker logo"></p>
 
@@ -19,13 +19,13 @@ installs updates.
 
 ## Install
 
-1. Download and unpack this project.
-2. Open a terminal in the `PlasmaColorPicker` folder.
-3. Run:
+Open a terminal and run these commands one at a time:
 
-   ```sh
-   ./install.sh
-   ```
+```sh
+git clone https://github.com/neverloseagain1/PlasmaColorPicker.git
+cd PlasmaColorPicker
+./install.sh
+```
 
 The installer asks which language to use, checks the programs it needs, builds
 the widget, and installs it for your account. If something is missing, it shows
@@ -42,6 +42,9 @@ settings tool, and `unar` or `7z` for theme archives.
 After installation, right-click your desktop or panel, choose **Add Widgets**,
 find **PlasmaColorPicker (PCP)**, and add it.
 
+If the `git` command is not found, install Git from your distribution's official
+repositories and then run the commands above.
+
 ## Use
 
 Click the PCP icon to open the widget. Use **EN/RU** at the top to change the
@@ -50,6 +53,10 @@ messages.
 
 ### Palettes
 
+<table>
+<tr>
+<td width="55%" valign="top">
+<p>
 On **Palettes**, choose a source type or leave **Automatic**, then select
 **Analyze wallpaper**. Automatic mode reads the active Plasma wallpaper
 plugin's settings and handles still images, GIF/WebP animations, and video
@@ -58,7 +65,9 @@ analysis samples frames across the clip. Video analysis requires `ffmpeg` and
 `ffprobe` from FFmpeg. PCP also reads enabled video entries from Smart Video
 Wallpaper Reborn's playlist. **Slideshow** samples up to eight images from its
 configured folders.
+</p>
 
+<p>
 PCP shows color suggestions and what each color is for. Select **Apply palette**
 to save and use one. PCP keeps the original Plasma theme unchanged and makes
 its own copy for the new colors.
@@ -66,18 +75,32 @@ its own copy for the new colors.
 **Delete palettes** removes palettes made by PCP and restores the previous
 appearance, including any accent and inactive-header colors PCP temporarily
 overrode.
-
-<p align="center"><img src="contents/images/pcp-side-1-palettes-en.png" width="100%" alt="Color palettes generated from different wallpapers"></p>
+</p>
+</td>
+<td width="45%" valign="top"><img width="100%" src="contents/images/pcp-side-1-palettes-en.png" alt="Color palettes generated from different wallpapers"></td>
+</tr>
+</table>
 
 ### Find and install themes
 
+<table>
+<tr>
+<td width="45%" valign="top"><img width="100%" src="contents/images/pcp-side-2-themes-en.png" alt="Finding matching icon and cursor themes"></td>
+<td width="55%" valign="top">
+<p>
 On **Icon themes** or **Cursor themes**, choose a palette and select **Find
 icons** or **Find cursors**. Choose a result to open it in KDE Store.
 If KDE Store's catalog API is unavailable, PCP shows the API error and offers a
 direct search on the store website.
+</p>
+</td>
+</tr>
+</table>
 
-<p align="center"><img src="contents/images/pcp-side-2-themes-en.png" width="100%" alt="Finding matching icon and cursor themes"></p>
-
+<table>
+<tr>
+<td width="55%" valign="top">
+<p>
 On **Install**, choose whether the archive contains icons or cursors. Drop the
 archive into the box or choose a file. PCP checks folders inside the archive,
 including archives wrapped inside other archives, and installs every matching
@@ -91,12 +114,17 @@ depend on the installed extractor and include ZIP/ZIPX, 7z, RAR, TAR and
 compressed TAR, CAB, ISO, LZH, RPM, and other formats recognized by `unar` or
 `7z`. PCP detects common archive signatures as well as file extensions,
 including for nested archives.
+</p>
 
-<p align="center"><img src="contents/images/pcp-side-3-install-en.png" width="100%" alt="Installing icon and cursor themes from an archive"></p>
-
+<p>
 To use an installed theme, open **System Settings → Colors & Themes → Icons**
 or **Cursors** and select it. If that page was already open, close and reopen
 it.
+</p>
+</td>
+<td width="45%" valign="top"><img width="100%" src="contents/images/pcp-side-3-install-en.png" alt="Installing icon and cursor themes from an archive"></td>
+</tr>
+</table>
 
 ### Updates
 
