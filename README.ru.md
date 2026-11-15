@@ -22,7 +22,7 @@ README при проверке исключаются. Виджет только
 Откройте терминал и выполните команды по очереди:
 
 ```sh
-git clone https://github.com/neverloseagain1/PlasmaColorPicker.git
+git clone https://github.com/neverloseagain1/PlasmaColorPicker
 cd PlasmaColorPicker
 ./install.sh
 ```
