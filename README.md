@@ -22,7 +22,7 @@ installs updates.
 Open a terminal and run these commands one at a time:
 
 ```sh
-git clone https://github.com/neverloseagain1/PlasmaColorPicker.git
+git clone https://github.com/neverloseagain1/PlasmaColorPicker
 cd PlasmaColorPicker
 ./install.sh
 ```
