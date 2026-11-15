@@ -57,22 +57,22 @@ messages.
 <tr>
 <td width="55%" valign="top">
 <p>
-On **Palettes**, choose a source type or leave **Automatic**, then select
-**Analyze wallpaper**. Automatic mode reads the active Plasma wallpaper
+On <strong>Palettes</strong>, choose a source type or leave <strong>Automatic</strong>, then select
+<strong>Analyze wallpaper</strong>. Automatic mode reads the active Plasma wallpaper
 plugin's settings and handles still images, GIF/WebP animations, and video
 accordingly. GIF and animated WebP analysis samples multiple frames; video
-analysis samples frames across the clip. Video analysis requires `ffmpeg` and
-`ffprobe` from FFmpeg. PCP also reads enabled video entries from Smart Video
-Wallpaper Reborn's playlist. **Slideshow** samples up to eight images from its
+analysis samples frames across the clip. Video analysis requires <code>ffmpeg</code> and
+<code>ffprobe</code> from FFmpeg. PCP also reads enabled video entries from Smart Video
+Wallpaper Reborn's playlist. <strong>Slideshow</strong> samples up to eight images from its
 configured folders.
 </p>
 
 <p>
-PCP shows color suggestions and what each color is for. Select **Apply palette**
+PCP shows color suggestions and what each color is for. Select <strong>Apply palette</strong>
 to save and use one. PCP keeps the original Plasma theme unchanged and makes
 its own copy for the new colors.
 
-**Delete palettes** removes palettes made by PCP and restores the previous
+<strong>Delete palettes</strong> removes palettes made by PCP and restores the previous
 appearance, including any accent and inactive-header colors PCP temporarily
 overrode.
 </p>
@@ -88,8 +88,8 @@ overrode.
 <td width="45%" valign="top"><img width="100%" src="contents/images/pcp-side-2-themes-en.png" alt="Finding matching icon and cursor themes"></td>
 <td width="55%" valign="top">
 <p>
-On **Icon themes** or **Cursor themes**, choose a palette and select **Find
-icons** or **Find cursors**. Choose a result to open it in KDE Store.
+On <strong>Icon themes</strong> or <strong>Cursor themes</strong>, choose a palette and select <strong>Find
+icons</strong> or <strong>Find cursors</strong>. Choose a result to open it in KDE Store.
 If KDE Store's catalog API is unavailable, PCP shows the API error and offers a
 direct search on the store website.
 </p>
@@ -101,24 +101,24 @@ direct search on the store website.
 <tr>
 <td width="55%" valign="top">
 <p>
-On **Install**, choose whether the archive contains icons or cursors. Drop the
+On <strong>Install</strong>, choose whether the archive contains icons or cursors. Drop the
 archive into the box or choose a file. PCP checks folders inside the archive,
 including archives wrapped inside other archives, and installs every matching
 theme it finds. It supports high-resolution icon themes and does not replace an
-existing theme. PCP tries `unar` first and tries `7z` if `unar` cannot unpack
+existing theme. PCP tries <code>unar</code> first and tries <code>7z</code> if <code>unar</code> cannot unpack
 the file. Absolute links to files or folders in installed icon and cursor
 themes are safely copied into the installed theme; links outside theme
-directories are rejected. Some themes with internal links require `unar`. If
+directories are rejected. Some themes with internal links require <code>unar</code>. If
 PCP cannot install an archive, it explains what to do next. Supported formats
 depend on the installed extractor and include ZIP/ZIPX, 7z, RAR, TAR and
-compressed TAR, CAB, ISO, LZH, RPM, and other formats recognized by `unar` or
-`7z`. PCP detects common archive signatures as well as file extensions,
+compressed TAR, CAB, ISO, LZH, RPM, and other formats recognized by <code>unar</code> or
+<code>7z</code>. PCP detects common archive signatures as well as file extensions,
 including for nested archives.
 </p>
 
 <p>
-To use an installed theme, open **System Settings → Colors & Themes → Icons**
-or **Cursors** and select it. If that page was already open, close and reopen
+To use an installed theme, open <strong>System Settings → Colors &amp; Themes → Icons</strong>
+or <strong>Cursors</strong> and select it. If that page was already open, close and reopen
 it.
 </p>
 </td>
