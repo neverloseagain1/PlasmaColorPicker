@@ -1,4 +1,5 @@
 #!/bin/sh
+# Remove the installed widget and its icon without deleting user themes or palettes.
 set -eu
 
 case "${PCP_LANG:-${LC_MESSAGES:-${LANG:-en}}}" in

@@ -1,3 +1,4 @@
+// Registers the General settings page in Plasma's configuration dialog.
 import QtQuick
 import org.kde.plasma.configuration
 

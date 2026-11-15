@@ -1,4 +1,5 @@
 #!/bin/sh
+# Check dependencies, build the helper, and install the Plasma widget package.
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

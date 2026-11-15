@@ -1,13 +1,25 @@
-use image::{ImageReader, RgbaImage};
+//! CLI helper for wallpaper analysis, Plasma appearance changes, and theme management.
+
+use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
+use image::{AnimationDecoder, ImageReader, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::Seek;
+use std::io::{self, BufReader, Cursor};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod theme_install;
+mod updates;
+
+use theme_install::*;
+use updates::*;
+
+// Shared data structures for palettes, commands, and persisted appearance state.
 #[derive(Clone, Serialize)]
 struct Palette {
     index: usize,
@@ -38,6 +50,40 @@ fn generated_theme_id_for_scheme(scheme_id: &str) -> String {
 struct AnalyzeResult {
     action: &'static str,
     palettes: Vec<Palette>,
+    source_type: String,
+    sample_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalysisType {
+    Auto,
+    Image,
+    Gif,
+    Video,
+    Slideshow,
+}
+
+impl AnalysisType {
+    fn parse(value: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        match value.unwrap_or("auto") {
+            "auto" => Ok(Self::Auto),
+            "image" => Ok(Self::Image),
+            "gif" => Ok(Self::Gif),
+            "video" => Ok(Self::Video),
+            "slideshow" => Ok(Self::Slideshow),
+            _ => Err("Analysis type must be auto, image, gif, video, or slideshow".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Image => "image",
+            Self::Gif => "gif",
+            Self::Video => "video",
+            Self::Slideshow => "slideshow",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -53,6 +99,17 @@ struct StoreThemesResult {
     action: &'static str,
     search_color: String,
     themes: Vec<StoreTheme>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_search_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WallpaperVideoEntry {
+    filename: String,
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -85,6 +142,14 @@ struct InstalledTheme {
 struct UserState {
     previous_color_scheme: Option<String>,
     previous_desktop_theme: Option<String>,
+    #[serde(default)]
+    previous_accent_color: Option<String>,
+    #[serde(default)]
+    previous_inactive_header_background: Option<String>,
+    #[serde(default)]
+    previous_inactive_header_alternate: Option<String>,
+    #[serde(default)]
+    appearance_settings_captured: bool,
 }
 
 const GENERATED_THEME_ID: &str = "wallpaperpalette-generated";
@@ -105,6 +170,7 @@ struct DiagnosticResult {
     checks: Vec<DiagnosticCheck>,
 }
 
+// Parse helper commands and serialize their results for the QML widget.
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -116,13 +182,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("analyze") => {
-            let wallpaper = current_wallpaper()?;
-            let palettes = create_palettes(&wallpaper)?;
+            let mode = AnalysisType::parse(args.next().as_deref())?;
+            if args.next().is_some() {
+                return Err("Usage: plasmacolorpicker-helper analyze [auto|image|gif|video|slideshow]".into());
+            }
+            let (palettes, sample_count, source_type) = analyze_wallpaper(mode)?;
             println!(
                 "{}",
                 serde_json::to_string(&AnalyzeResult {
                     action: "analyze",
                     palettes,
+                    source_type: source_type.to_string(),
+                    sample_count,
                 })?
             );
         }
@@ -131,24 +202,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or_else(|| format!("Usage: plasmacolorpicker-helper {action} <0|1|2>"))?
                 .parse::<usize>()?;
+            let mode = AnalysisType::parse(args.next().as_deref())?;
             if index > 2 || args.next().is_some() {
                 return Err("Palette index must be 0, 1, or 2".into());
             }
-            let wallpaper = current_wallpaper()?;
-            let palettes = create_palettes(&wallpaper)?;
+            let (palettes, _, _) = analyze_wallpaper(mode)?;
             let search_color = hue_search_term(&palettes[index].accent)?;
             let (category, action) = if action == "icons" {
                 (132, "icons")
             } else {
                 (107, "cursors")
             };
-            let themes = search_store_themes(&search_color, category)?;
+            let (themes, catalog_error, store_search_url) =
+                match search_store_themes(&search_color, category) {
+                    Ok(themes) => (themes, None, None),
+                    Err(error) => (
+                        Vec::new(),
+                        Some(error.to_string()),
+                        Some(format!(
+                            "https://store.kde.org/browse?cat={category}&search={search_color}"
+                        )),
+                    ),
+                };
             println!(
                 "{}",
                 serde_json::to_string(&StoreThemesResult {
                     action,
                     search_color,
                     themes,
+                    catalog_error,
+                    store_search_url,
                 })?
             );
         }
@@ -170,6 +253,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("diagnose") => {
             println!("{}", serde_json::to_string(&diagnose())?);
         }
+        Some("check-updates") => {
+            let baseline = args
+                .next()
+                .ok_or("Usage: plasmacolorpicker-helper check-updates <baseline-file>")?;
+            if args.next().is_some() {
+                return Err("Usage: plasmacolorpicker-helper check-updates <baseline-file>".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&check_repository_updates(Path::new(&baseline))?)?
+            );
+        }
         Some("remove") => {
             if args.next().is_some() {
                 return Err("Usage: plasmacolorpicker-helper remove".into());
@@ -181,22 +276,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or("Usage: plasmacolorpicker-helper apply <0|1|2>")?
                 .parse::<usize>()?;
+            let mode = AnalysisType::parse(args.next().as_deref())?;
             if index > 2 || args.next().is_some() {
                 return Err("Palette index must be 0, 1, or 2".into());
             }
-            let wallpaper = current_wallpaper()?;
-            let palettes = create_palettes(&wallpaper)?;
+            let (palettes, _, _) = analyze_wallpaper(mode)?;
             apply_palette(&palettes[index])?;
         }
         _ => {
             return Err(
-                "Usage: plasmacolorpicker-helper analyze | icons INDEX | cursors INDEX | install-theme <icons|cursors> <archive> | diagnose | apply INDEX | remove".into(),
+                "Usage: plasmacolorpicker-helper analyze [TYPE] | icons INDEX [TYPE] | cursors INDEX [TYPE] | install-theme <icons|cursors> <archive> | check-updates <baseline-file> | diagnose | apply INDEX [TYPE] | remove".into(),
             )
         }
     }
     Ok(())
 }
 
+// Search KDE Store for icon and cursor themes matching a palette.
 fn hue_search_term(color: &str) -> Result<String, Box<dyn std::error::Error>> {
     if color.len() != 7 || !color.starts_with('#') {
         return Err("Expected an RGB color in #RRGGBB format".into());
@@ -236,8 +332,24 @@ fn search_store_themes(
         .timeout(Duration::from_secs(12))
         .call()?
         .into_json()?;
+    parse_store_themes_response(&response)
+}
+
+fn parse_store_themes_response(
+    response: &serde_json::Value,
+) -> Result<Vec<StoreTheme>, Box<dyn std::error::Error>> {
     if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
-        return Err("KDE Store did not return a successful catalog response".into());
+        let status_code = response
+            .get("statuscode")
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = response
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the response did not contain a status message");
+        return Err(
+            format!("KDE Store catalog API returned status {status_code}: {message}").into(),
+        );
     }
     let items = response
         .get("data")
@@ -273,7 +385,58 @@ fn search_store_themes(
     Ok(themes)
 }
 
+// Read the active wallpaper source and analyze still images, slideshows, and video.
 fn current_wallpaper() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let (plugin, settings) = active_wallpaper_settings()?;
+    let keys = if plugin == "org.kde.slideshow" {
+        ["Image", "MediaSource", "Video", "Source", "File", "Path"]
+    } else {
+        ["MediaSource", "Image", "Video", "Source", "File", "Path"]
+    };
+    let path = keys
+        .into_iter()
+        .filter_map(|key| settings.get(key))
+        .filter_map(|value| local_path(value))
+        .find(|path| path.is_file());
+    if let Some(path) = path {
+        return Ok(path);
+    }
+    if let Some(path) = configured_video_paths(&settings)?
+        .into_iter()
+        .find(|path| path.is_file())
+    {
+        return Ok(path);
+    }
+    if plugin == "org.kde.slideshow" {
+        if let Some(path) = slideshow_image_paths(&settings)?.into_iter().next() {
+            return Ok(path);
+        }
+    }
+    Err(format!("No readable wallpaper source was found for plugin {plugin}").into())
+}
+
+fn configured_video_paths(
+    settings: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let Some(value) = settings.get("VideoUrls") else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<WallpaperVideoEntry> = serde_json::from_str(value).map_err(|error| {
+        format!("Cannot parse the wallpaper plugin's VideoUrls setting: {error}")
+    })?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .filter_map(|entry| local_path(&entry.filename))
+        .collect())
+}
+
+fn active_wallpaper_settings(
+) -> Result<(String, std::collections::BTreeMap<String, String>), Box<dyn std::error::Error>> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -286,49 +449,464 @@ fn current_wallpaper() -> Result<PathBuf, Box<dyn std::error::Error>> {
         )
     })?;
 
-    let mut current_screen = None;
-    let mut candidates = Vec::new();
-    let mut active_image_section = false;
+    parse_wallpaper_settings(&config)
+}
+
+fn parse_wallpaper_settings(
+    config: &str,
+) -> Result<(String, std::collections::BTreeMap<String, String>), Box<dyn std::error::Error>> {
+    let mut current_section = String::new();
+    let mut sections =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<String, String>>::new();
     for line in config.lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            active_image_section = line.contains("][Wallpaper][org.kde.image][General]");
+            current_section = line.to_string();
+            sections.entry(current_section.clone()).or_default();
             if line.starts_with("[Containments][") && !line.contains("][Wallpaper]") {
-                current_screen = None;
+                continue;
             }
-            continue;
         }
-
-        if line.starts_with("lastScreen=") {
-            current_screen = line["lastScreen=".len()..].parse::<i32>().ok();
-        } else if active_image_section && line.starts_with("Image=") {
-            let value = line["Image=".len()..].trim();
-            if let Some(path) = local_file_path(value) {
-                candidates.push((current_screen.unwrap_or(-1), path));
+        if let Some((key, value)) = line.split_once('=') {
+            if !current_section.is_empty() {
+                sections
+                    .entry(current_section.clone())
+                    .or_default()
+                    .insert(key.to_string(), value.to_string());
             }
         }
     }
 
-    candidates
+    let is_desktop = |section: &str, values: &std::collections::BTreeMap<String, String>| {
+        section.starts_with("[Containments][")
+            && section.matches("][").count() == 1
+            && values.get("formfactor").map(String::as_str).unwrap_or("0") == "0"
+    };
+    let selected = sections
         .iter()
-        .find(|(screen, path)| *screen == 0 && path.is_file())
-        .or_else(|| candidates.iter().find(|(_, path)| path.is_file()))
-        .map(|(_, path)| path.clone())
-        .ok_or_else(|| {
-            format!(
-                "No readable image wallpaper was found in {}",
-                config_path.display()
-            )
-            .into()
+        .find(|(section, values)| {
+            is_desktop(section, values)
+                && values.get("lastScreen").is_some_and(|screen| screen == "0")
         })
+        .or_else(|| {
+            sections
+                .iter()
+                .find(|(section, values)| is_desktop(section, values))
+        })
+        .ok_or("No Plasma desktop containment was found")?;
+    let containment = selected.0.as_str();
+    let plugin = selected
+        .1
+        .get("wallpaperplugin")
+        .map(String::as_str)
+        .unwrap_or("org.kde.image");
+    let wallpaper_section = format!("{containment}[Wallpaper][{plugin}][General]");
+    let settings = sections
+        .get(&wallpaper_section)
+        .ok_or_else(|| format!("No settings were found for active wallpaper plugin {plugin}"))?;
+    Ok((plugin.to_string(), settings.clone()))
 }
 
 fn local_file_path(value: &str) -> Option<PathBuf> {
-    let value = value.strip_prefix("file://")?;
+    local_path(value)
+}
+
+fn local_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    let value = value.strip_prefix("file://").unwrap_or(value);
+    if value.contains("://") {
+        return None;
+    }
     let decoded = percent_decode(value)?;
     Some(PathBuf::from(decoded))
 }
 
+fn analyze_wallpaper(
+    mode: AnalysisType,
+) -> Result<(Vec<Palette>, usize, &'static str), Box<dyn std::error::Error>> {
+    if mode == AnalysisType::Slideshow {
+        let (plugin, settings) = active_wallpaper_settings()?;
+        if plugin != "org.kde.slideshow" {
+            return Err("Slideshow mode requires the built-in Plasma slideshow wallpaper".into());
+        }
+        let paths = slideshow_image_paths(&settings)?;
+        let frames = paths
+            .iter()
+            .map(|path| -> Result<RgbaImage, Box<dyn std::error::Error>> {
+                let reader = ImageReader::open(path)?;
+                let image = reader.with_guessed_format()?.decode()?;
+                Ok(image.thumbnail(320, 320).to_rgba8())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (palettes, count) = palettes_from_frames(frames)?;
+        return Ok((palettes, count, "slideshow"));
+    }
+
+    let path = current_wallpaper()?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let selected_mode = match mode {
+        AnalysisType::Auto if matches!(extension.as_str(), "gif" | "webp") => AnalysisType::Gif,
+        AnalysisType::Auto if is_video_extension(&extension) => AnalysisType::Video,
+        AnalysisType::Auto => AnalysisType::Image,
+        explicit => explicit,
+    };
+
+    let frames = match selected_mode {
+        AnalysisType::Gif => {
+            if !matches!(extension.as_str(), "gif" | "webp") {
+                return Err(
+                    "Animated image mode requires a GIF or animated WebP wallpaper source".into(),
+                );
+            }
+            sample_animated_frames(&path, &extension)?
+        }
+        AnalysisType::Video => {
+            if !is_video_extension(&extension) {
+                return Err(
+                    "Video mode requires the active wallpaper source to be a video file".into(),
+                );
+            }
+            sample_video_frames(&path)?
+        }
+        AnalysisType::Slideshow => unreachable!(),
+        AnalysisType::Auto | AnalysisType::Image => {
+            if is_video_extension(&extension) || matches!(extension.as_str(), "gif" | "webp") {
+                return Err("Select Auto, Animated image, or Video for this wallpaper".into());
+            }
+            let image = ImageReader::open(&path)?.with_guessed_format()?.decode()?;
+            vec![image.thumbnail(320, 320).to_rgba8()]
+        }
+    };
+    if frames.is_empty() {
+        return Err("No frames could be decoded from the wallpaper".into());
+    }
+
+    let (palettes, count) = if selected_mode == AnalysisType::Video {
+        palettes_from_video_frames(frames)?
+    } else {
+        palettes_from_frames(frames)?
+    };
+    Ok((palettes, count, selected_mode.as_str()))
+}
+
+fn palettes_from_frames(
+    frames: Vec<RgbaImage>,
+) -> Result<(Vec<Palette>, usize), Box<dyn std::error::Error>> {
+    if frames.is_empty() {
+        return Err("No frames could be decoded from the wallpaper".into());
+    }
+    let sample = combine_sample_frames(&frames);
+    let colors = estimate_wallpaper_colors(&sample);
+    let palettes = colors
+        .into_iter()
+        .enumerate()
+        .map(|(index, (hue, saturation, lightness, region_hue))| {
+            palette_from_color(index, hue, saturation, lightness, region_hue)
+        })
+        .collect();
+    Ok((palettes, frames.len()))
+}
+
+fn palettes_from_video_frames(
+    frames: Vec<RgbaImage>,
+) -> Result<(Vec<Palette>, usize), Box<dyn std::error::Error>> {
+    if frames.is_empty() {
+        return Err("No frames could be decoded from the wallpaper".into());
+    }
+
+    let sample_count = frames.len();
+    let total_pixels = frames
+        .iter()
+        .map(|frame| u64::from(frame.width()) * u64::from(frame.height()))
+        .sum::<u64>();
+    let chromatic_pixels = frames
+        .iter()
+        .flat_map(RgbaImage::pixels)
+        .filter(|pixel| {
+            let [red, green, blue, alpha] = pixel.0;
+            if alpha < 128 {
+                return false;
+            }
+            let (_, saturation, lightness) = rgb_to_hsl(
+                f64::from(red) / 255.0,
+                f64::from(green) / 255.0,
+                f64::from(blue) / 255.0,
+            );
+            saturation >= 0.15 && (0.035..=0.94).contains(&lightness)
+        })
+        .count() as u64;
+
+    let palettes = if chromatic_pixels as f64 / (total_pixels.max(1) as f64) < 0.01 {
+        (0..3).map(neutral_video_palette).collect()
+    } else {
+        estimate_wallpaper_colors(&combine_sample_frames(&frames))
+            .into_iter()
+            .enumerate()
+            .map(|(index, (hue, saturation, lightness, region_hue))| {
+                palette_from_color(index, hue, saturation, lightness, region_hue)
+            })
+            .collect()
+    };
+    Ok((palettes, sample_count))
+}
+
+fn neutral_video_palette(index: usize) -> Palette {
+    let (panel, background, surface, accent, selection) = match index {
+        0 => ("#242428", "#19191C", "#303035", "#A1A1AA", "#52525B"),
+        1 => ("#29292D", "#1D1D21", "#36363B", "#D4D4D8", "#71717A"),
+        _ => ("#202023", "#161618", "#2B2B2F", "#737373", "#404040"),
+    };
+    let selection_rgb = (
+        f64::from(u8::from_str_radix(&selection[1..3], 16).expect("valid palette color")) / 255.0,
+        f64::from(u8::from_str_radix(&selection[3..5], 16).expect("valid palette color")) / 255.0,
+        f64::from(u8::from_str_radix(&selection[5..7], 16).expect("valid palette color")) / 255.0,
+    );
+    Palette {
+        index,
+        name: format!("PlasmaColorPicker {:02}", index + 1),
+        panel: panel.to_string(),
+        background: background.to_string(),
+        surface: surface.to_string(),
+        accent: accent.to_string(),
+        selection: selection.to_string(),
+        foreground: "#F4F4F5".to_string(),
+        selection_foreground: contrast_foreground(selection_rgb),
+    }
+}
+
+fn slideshow_image_paths(
+    settings: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    if let Some(paths) = settings.get("SlidePaths") {
+        for value in paths.split(',') {
+            if let Some(path) = local_path(value) {
+                collect_slideshow_files(&path, 0, &mut files)?;
+                if files.len() >= 256 {
+                    break;
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        if let Some(image) = settings.get("Image").and_then(|value| local_path(value)) {
+            if image.is_file() {
+                files.push(image);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.len() > 8 {
+        let length = files.len();
+        files = (0..8)
+            .map(|index| files[index * (length - 1) / 7].clone())
+            .collect();
+    }
+    Ok(files)
+}
+
+fn collect_slideshow_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    if files.len() >= 256 || depth > 8 {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_file() {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            extension.as_str(),
+            "png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif"
+        ) {
+            files.push(path.to_path_buf());
+        }
+    } else if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort();
+        for entry in entries {
+            collect_slideshow_files(&entry, depth + 1, files)?;
+            if files.len() >= 256 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_video_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "mp4"
+            | "webm"
+            | "mkv"
+            | "mov"
+            | "m4v"
+            | "avi"
+            | "wmv"
+            | "flv"
+            | "mpeg"
+            | "mpg"
+            | "ogv"
+            | "3gp"
+            | "ts"
+            | "mts"
+            | "m2ts"
+    )
+}
+
+fn sample_animated_frames(
+    path: &Path,
+    extension: &str,
+) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
+    let reader = BufReader::new(fs::File::open(path)?);
+    if extension == "webp" {
+        return sample_animation_frames(WebPDecoder::new(reader)?);
+    }
+    sample_animation_frames(GifDecoder::new(reader)?)
+}
+
+fn sample_animation_frames<'a, D>(decoder: D) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>>
+where
+    D: AnimationDecoder<'a>,
+{
+    const MAX_FRAMES: usize = 8;
+    let mut samples = Vec::with_capacity(MAX_FRAMES);
+    let mut random_state = 0x9E37_79B9_u64;
+    for frame in decoder.into_frames() {
+        let frame = frame?;
+        let (delay_numerator, delay_denominator) = frame.delay().numer_denom_ms();
+        let duration_ms = if delay_denominator == 0 {
+            100.0
+        } else {
+            (f64::from(delay_numerator) / f64::from(delay_denominator)).max(10.0)
+        };
+        let image = image::DynamicImage::ImageRgba8(frame.into_buffer())
+            .thumbnail(320, 320)
+            .to_rgba8();
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 7;
+        random_state ^= random_state << 17;
+        let random_unit = ((random_state >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
+        let priority = random_unit.ln() / duration_ms;
+        if samples.len() < MAX_FRAMES {
+            samples.push((priority, image));
+        } else if let Some((minimum_index, (minimum_priority, _))) = samples
+            .iter()
+            .enumerate()
+            .min_by(|(_, (left, _)), (_, (right, _))| left.total_cmp(right))
+        {
+            if priority > *minimum_priority {
+                samples[minimum_index] = (priority, image);
+            }
+        }
+    }
+    Ok(samples.into_iter().map(|(_, image)| image).collect())
+}
+
+fn sample_video_frames(path: &Path) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Video analysis requires ffprobe from FFmpeg: {error}"))?;
+    if !probe.status.success() {
+        return Err(format!(
+            "ffprobe could not read the video: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        )
+        .into());
+    }
+    let duration = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse::<f64>()?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err("The video has no valid duration to sample".into());
+    }
+
+    let mut frames = Vec::new();
+    let mut previous_timestamp: Option<f64> = None;
+    for fraction in [0.08, 0.24, 0.40, 0.56, 0.72, 0.88] {
+        let timestamp = (duration * fraction).min((duration - 0.02).max(0.0));
+        if previous_timestamp.is_some_and(|previous| (timestamp - previous).abs() < 0.001) {
+            continue;
+        }
+        previous_timestamp = Some(timestamp);
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss"])
+            .arg(format!("{timestamp:.3}"))
+            .arg("-i")
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=320:320:force_original_aspect_ratio=decrease",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ])
+            .output()
+            .map_err(|error| format!("Video analysis requires FFmpeg: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "FFmpeg could not decode a frame at {timestamp:.3}s: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        if output.stdout.is_empty() {
+            continue;
+        }
+        let image = ImageReader::new(Cursor::new(output.stdout))
+            .with_guessed_format()?
+            .decode()?
+            .thumbnail(320, 320)
+            .to_rgba8();
+        frames.push(image);
+    }
+    if frames.is_empty() {
+        return Err("FFmpeg could not decode any video frames".into());
+    }
+    Ok(frames)
+}
+
+fn combine_sample_frames(frames: &[RgbaImage]) -> RgbaImage {
+    let width = frames.iter().map(RgbaImage::width).max().unwrap_or(1);
+    let height = frames.iter().map(RgbaImage::height).sum::<u32>().max(1);
+    let mut combined = RgbaImage::new(width, height);
+    let mut y_offset = 0;
+    for frame in frames {
+        for (x, y, pixel) in frame.enumerate_pixels() {
+            combined.put_pixel(x, y + y_offset, *pixel);
+        }
+        y_offset += frame.height();
+    }
+    combined
+}
+
+// Check required desktop tools and filesystem/configuration conditions.
 fn diagnose() -> DiagnosticResult {
     let wallpaper = current_wallpaper().map_err(|error| error.to_string());
     let mut checks = vec![DiagnosticCheck {
@@ -340,21 +918,37 @@ fn diagnose() -> DiagnosticResult {
             .unwrap_or_else(|error| error.clone()),
     }];
 
-    let image_check = wallpaper.and_then(|path| {
-        ImageReader::open(&path)
-            .map_err(|error| error.to_string())?
-            .with_guessed_format()
-            .map_err(|error| error.to_string())?
-            .decode()
-            .map(|_| path)
-            .map_err(|error| error.to_string())
-    });
+    let image_check = wallpaper
+        .as_ref()
+        .map_err(|error| error.to_string())
+        .and_then(|path| -> Result<String, String> {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if extension == "gif" || extension == "webp" {
+                sample_animated_frames(path, &extension)
+                    .map(|frames| format!("Decoded {} animation frames", frames.len()))
+                    .map_err(|error| error.to_string())
+            } else if is_video_extension(&extension) {
+                sample_video_frames(path)
+                    .map(|frames| format!("Decoded {} video frames", frames.len()))
+                    .map_err(|error| error.to_string())
+            } else {
+                ImageReader::open(path)
+                    .map_err(|error| error.to_string())?
+                    .with_guessed_format()
+                    .map_err(|error| error.to_string())?
+                    .decode()
+                    .map(|_| format!("Decoded {}", path.display()))
+                    .map_err(|error| error.to_string())
+            }
+        });
     checks.push(DiagnosticCheck {
         id: "image",
         ok: image_check.is_ok(),
-        details: image_check
-            .map(|path| format!("Decoded {}", path.display()))
-            .unwrap_or_else(|error| error),
+        details: image_check.unwrap_or_else(|error| error),
     });
 
     let apply_command = find_executable("plasma-apply-colorscheme");
@@ -426,6 +1020,7 @@ fn diagnose() -> DiagnosticResult {
     }
 }
 
+// Resolve XDG paths and read/write the helper's saved state and KDE settings.
 fn find_executable(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
         .map(|directory| directory.join(name))
@@ -454,870 +1049,6 @@ fn user_data_dir() -> io::Result<PathBuf> {
         env::var_os("HOME").map(PathBuf::from),
         ".local/share",
     )
-}
-
-struct TemporaryDirectory(PathBuf);
-
-impl TemporaryDirectory {
-    fn create(parent: &Path, prefix: &str) -> io::Result<Self> {
-        for attempt in 0..100 {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = parent.join(format!("{prefix}-{}-{nonce}-{attempt}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "Could not create a unique temporary directory",
-        ))
-    }
-}
-
-impl Drop for TemporaryDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn install_theme(
-    theme_type: &str,
-    archive_argument: &str,
-) -> Result<InstallThemeResult, Box<dyn std::error::Error>> {
-    if !matches!(theme_type, "icons" | "cursors") {
-        return Err("Theme type must be icons or cursors".into());
-    }
-    let archive_path = local_file_path(archive_argument)
-        .or_else(|| {
-            let path = PathBuf::from(archive_argument);
-            path.is_absolute().then_some(path)
-        })
-        .ok_or("Select a local archive file")?;
-    if !archive_path.is_absolute() {
-        return Err("The selected archive path must be local and absolute".into());
-    }
-    let metadata = fs::metadata(&archive_path)?;
-    if !metadata.is_file() {
-        return Err("The selected path is not a regular file".into());
-    }
-    if metadata.len() == 0 || metadata.len() > 512 * 1024 * 1024 {
-        return Err("The archive must be non-empty and no larger than 512 MiB".into());
-    }
-    let unar = find_executable("unar");
-    let seven_zip = find_executable("7z");
-    if unar.is_none() && seven_zip.is_none() {
-        return Err(
-            "Neither unar nor 7z is installed; install one of them or use System Settings to install this theme manually"
-                .into(),
-        );
-    }
-
-    let staging = TemporaryDirectory::create(&env::temp_dir(), "pcp-theme-archive")?;
-    extract_theme_archive(
-        unar.as_deref(),
-        seven_zip.as_deref(),
-        &archive_path,
-        theme_type,
-        &staging.0,
-    )?;
-
-    let mut candidates = Vec::new();
-    let mut entry_count = 0usize;
-    let mut extracted_bytes = 0u64;
-    let staging_root = fs::canonicalize(&staging.0)?;
-    validate_extracted_tree(
-        &staging_root,
-        &staging_root,
-        0,
-        &mut entry_count,
-        &mut extracted_bytes,
-    )?;
-    find_theme_directories(&staging.0, theme_type, 0, &mut candidates)?;
-    if candidates.is_empty() {
-        return Err(format!(
-            "No installable {theme_type} theme was found: the archive must contain an index.theme file and theme assets. It may be an add-on pack rather than the main theme."
-        )
-        .into());
-    }
-
-    let install_directory = theme_install_directory(theme_type)?;
-    fs::create_dir_all(&install_directory)?;
-    let existing_theme_directories = icon_theme_directories()?;
-    let mut reserved_folder_names = Vec::with_capacity(candidates.len());
-    let mut themes_to_install = Vec::with_capacity(candidates.len());
-    for theme_root in candidates {
-        let index_contents = fs::read_to_string(theme_root.join("index.theme"))?;
-        let display_name = read_ini_value(&index_contents, "Icon Theme", "Name")
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| {
-                theme_root
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into()
-            });
-        let original_folder_name = if theme_root == staging.0 {
-            archive_theme_id(&archive_path)
-        } else {
-            safe_theme_id(&theme_root.file_name().unwrap_or_default().to_string_lossy())
-        }
-        .ok_or("The theme folder name is not valid")?;
-        let folder_name = unique_theme_folder_name(
-            &original_folder_name,
-            &existing_theme_directories,
-            &reserved_folder_names,
-        )?;
-        reserved_folder_names.push(folder_name.clone());
-        themes_to_install.push((display_name, original_folder_name, folder_name, theme_root));
-    }
-
-    let install_staging = TemporaryDirectory::create(&install_directory, ".pcp-theme-install")?;
-    let renamed_theme_ids = themes_to_install
-        .iter()
-        .filter(|(_, original, folder, _)| original != folder)
-        .map(|(_, original, folder, _)| (original.clone(), folder.clone()))
-        .collect::<Vec<_>>();
-    for (_, original_folder_name, folder_name, theme_root) in &themes_to_install {
-        let canonical_theme_root = fs::canonicalize(theme_root)?;
-        let staged_theme = install_staging.0.join(folder_name);
-        copy_theme_tree(theme_root, &staged_theme, &canonical_theme_root)?;
-        let make_single_hidden_theme_visible = themes_to_install.len() == 1;
-        if make_single_hidden_theme_visible {
-            make_hidden_theme_selectable(&staged_theme, folder_name)?;
-        }
-        rewrite_theme_index_for_install(
-            &staged_theme,
-            original_folder_name,
-            folder_name,
-            &renamed_theme_ids,
-        )?;
-    }
-
-    let mut installed_paths = Vec::with_capacity(themes_to_install.len());
-    let mut installed = Vec::with_capacity(themes_to_install.len());
-    for (display_name, _, folder_name, _) in themes_to_install {
-        let staged_theme = install_staging.0.join(&folder_name);
-        let destination = install_directory.join(&folder_name);
-        if let Err(error) = fs::create_dir(&destination) {
-            for path in &installed_paths {
-                let _ = fs::remove_dir_all(path);
-            }
-            return Err(error.into());
-        }
-        installed_paths.push(destination.clone());
-        let move_result = fs::read_dir(&staged_theme).and_then(|entries| {
-            for entry in entries {
-                let entry = entry?;
-                fs::rename(entry.path(), destination.join(entry.file_name()))?;
-            }
-            Ok(())
-        });
-        if let Err(error) = move_result {
-            for path in &installed_paths {
-                let _ = fs::remove_dir_all(path);
-            }
-            return Err(error.into());
-        }
-        fs::remove_dir(staged_theme)?;
-        let installed_index = fs::read_to_string(destination.join("index.theme"))?;
-        let display_name = read_ini_value(&installed_index, "Icon Theme", "Name")
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or(display_name);
-        installed.push(InstalledTheme {
-            name: display_name,
-            install_path: destination.display().to_string(),
-        });
-    }
-
-    Ok(InstallThemeResult {
-        action: "install-theme",
-        theme_type: theme_type.to_string(),
-        themes: installed,
-    })
-}
-
-fn extract_theme_archive(
-    unar: Option<&Path>,
-    seven_zip: Option<&Path>,
-    archive: &Path,
-    theme_type: &str,
-    destination: &Path,
-) -> io::Result<()> {
-    let extract = |input: &Path, output: &Path| {
-        if let Some(unar) = unar {
-            extract_with_unar(unar, input, output)
-        } else {
-            let seven_zip = seven_zip.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Neither unar nor 7z is available")
-            })?;
-            extract_with_7z_checked(seven_zip, input, output)
-        }
-    };
-    extract(archive, destination)?;
-    for _ in 0..4 {
-        let mut themes = Vec::new();
-        find_theme_directories(destination, theme_type, 0, &mut themes)?;
-        if !themes.is_empty() {
-            return Ok(());
-        }
-        let Some(inner_tar) = find_inner_tar(destination)? else {
-            return Ok(());
-        };
-        let nested_layer = TemporaryDirectory::create(destination, ".pcp-tar-layer")?;
-        extract(&inner_tar, &nested_layer.0)?;
-        fs::remove_file(inner_tar)?;
-        for entry in fs::read_dir(&nested_layer.0)? {
-            let entry = entry?;
-            let target = destination.join(entry.file_name());
-            match fs::symlink_metadata(&target) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    fs::rename(entry.path(), target)?;
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "Nested archive layers contain conflicting path {}",
-                            target.display()
-                        ),
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    if find_inner_tar(destination)?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The archive contains too many nested TAR layers",
-        ));
-    }
-    Ok(())
-}
-
-fn extract_with_7z_checked(seven_zip: &Path, archive: &Path, destination: &Path) -> io::Result<()> {
-    if let Err(error) = extract_with_7z(seven_zip, archive, destination) {
-        let details = error.to_string();
-        if details.contains("Dangerous link path") {
-            return Err(io::Error::other(format!(
-                "{details}. This archive uses relative symbolic links; install unar to preserve them safely"
-            )));
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn find_inner_tar(directory: &Path) -> io::Result<Option<PathBuf>> {
-    let mut tar_files = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && is_tar_archive(&entry.path())? {
-            tar_files.push(entry.path());
-        }
-    }
-    if tar_files.len() > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The compressed archive produced more than one top-level TAR file",
-        ));
-    }
-    Ok(tar_files.pop())
-}
-
-fn is_tar_archive(path: &Path) -> io::Result<bool> {
-    let mut file = fs::File::open(path)?;
-    let mut header = [0u8; 512];
-    match io::Read::read_exact(&mut file, &mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-        Err(error) => return Err(error),
-    }
-    let checksum_field = std::str::from_utf8(&header[148..156]).ok();
-    let stored_checksum = checksum_field
-        .map(|field| {
-            field.trim_matches(|character: char| {
-                character == '\0' || character.is_ascii_whitespace()
-            })
-        })
-        .and_then(|field| u64::from_str_radix(field, 8).ok());
-    let calculated_checksum = header
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| {
-            if (148..156).contains(&index) {
-                u64::from(b' ')
-            } else {
-                u64::from(*byte)
-            }
-        })
-        .sum::<u64>();
-    Ok(stored_checksum == Some(calculated_checksum))
-}
-
-fn extract_with_unar(unar: &Path, archive: &Path, destination: &Path) -> io::Result<()> {
-    let output = Command::new(unar)
-        .args(["-q", "-nr", "-o"])
-        .arg(destination)
-        .arg(archive)
-        .output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(io::Error::other(format_extraction_error(
-        "unar",
-        &output.stderr,
-    )))
-}
-
-fn extract_with_7z(seven_zip: &Path, archive: &Path, destination: &Path) -> io::Result<()> {
-    let output = Command::new(seven_zip)
-        .arg("x")
-        .arg("-y")
-        .arg(format!("-o{}", destination.display()))
-        .arg(archive)
-        .output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(io::Error::other(format_extraction_error(
-        "7z",
-        &output.stderr,
-    )))
-}
-
-fn format_extraction_error(extractor: &str, stderr: &[u8]) -> String {
-    let details = String::from_utf8_lossy(stderr);
-    let lines = details
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(8)
-        .collect::<Vec<_>>();
-    let summary = if lines.is_empty() {
-        "no details were provided".to_string()
-    } else {
-        lines.join("\n")
-    };
-    let omitted = details
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    let suffix = if omitted > lines.len() {
-        format!("\n… and {} more lines", omitted - lines.len())
-    } else {
-        String::new()
-    };
-    format!("{extractor} could not extract the archive: {summary}{suffix}")
-}
-
-fn icon_theme_directories() -> io::Result<Vec<PathBuf>> {
-    let mut directories = vec![user_data_dir()?.join("icons")];
-    if let Some(home) = env::var_os("HOME") {
-        directories.push(PathBuf::from(home).join(".icons"));
-    }
-    let data_dirs = env::var_os("XDG_DATA_DIRS")
-        .as_deref()
-        .map(env::split_paths)
-        .map(Iterator::collect)
-        .unwrap_or_else(|| {
-            vec![
-                PathBuf::from("/usr/local/share"),
-                PathBuf::from("/usr/share"),
-            ]
-        });
-    directories.extend(
-        data_dirs
-            .into_iter()
-            .map(|directory| directory.join("icons")),
-    );
-    directories.sort();
-    directories.dedup();
-    Ok(directories)
-}
-
-fn theme_install_directory(theme_type: &str) -> io::Result<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "Cannot determine home directory")
-    })?;
-    let data_home = user_data_dir()?;
-    theme_install_directory_for(theme_type, &data_home, &home)
-}
-
-fn theme_install_directory_for(
-    theme_type: &str,
-    data_home: &Path,
-    home: &Path,
-) -> io::Result<PathBuf> {
-    match theme_type {
-        "icons" => Ok(data_home.join("icons")),
-        "cursors" => Ok(home.join(".icons")),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Theme type must be icons or cursors",
-        )),
-    }
-}
-
-fn unique_theme_folder_name(
-    requested: &str,
-    theme_directories: &[PathBuf],
-    reserved: &[String],
-) -> io::Result<String> {
-    let is_available = |name: &str| -> io::Result<bool> {
-        if reserved.iter().any(|reserved_name| reserved_name == name) {
-            return Ok(false);
-        }
-        for directory in theme_directories {
-            match fs::symlink_metadata(directory.join(name)) {
-                Ok(_) => return Ok(false),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(true)
-    };
-    if is_available(requested)? {
-        return Ok(requested.to_string());
-    }
-    for suffix in 1..=999 {
-        let suffix = if suffix == 1 {
-            "-PCP".to_string()
-        } else {
-            format!("-PCP-{suffix}")
-        };
-        let base_length = 128usize.saturating_sub(suffix.len());
-        let base = requested.chars().take(base_length).collect::<String>();
-        let candidate = format!("{}{}", base.trim_end_matches(['-', '.', '_']), suffix);
-        if is_available(&candidate)? {
-            return Ok(candidate);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("Could not find a conflict-free folder name for {requested}"),
-    ))
-}
-
-fn rewrite_theme_index_for_install(
-    theme_root: &Path,
-    original_folder_name: &str,
-    folder_name: &str,
-    renamed_theme_ids: &[(String, String)],
-) -> io::Result<()> {
-    let index_path = theme_root.join("index.theme");
-    let contents = fs::read_to_string(&index_path)?;
-    let renamed = original_folder_name != folder_name;
-    let mut current_group = String::new();
-    let mut rewritten = String::with_capacity(contents.len());
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_group = trimmed[1..trimmed.len() - 1].to_string();
-            rewritten.push_str(line);
-            rewritten.push('\n');
-            continue;
-        }
-        if current_group == "Icon Theme" {
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                if key == "Name" && renamed {
-                    rewritten.push_str(&format!("{key}={} (PCP)\n", value.trim()));
-                    continue;
-                }
-                if key == "Inherits" {
-                    let inherits = value
-                        .split(',')
-                        .map(str::trim)
-                        .map(|inherit| {
-                            renamed_theme_id(inherit, renamed_theme_ids)
-                                .unwrap_or(inherit)
-                                .to_string()
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    rewritten.push_str(&format!("{key}={inherits}\n"));
-                    continue;
-                }
-            }
-        }
-        rewritten.push_str(line);
-        rewritten.push('\n');
-    }
-    if rewritten != contents {
-        fs::write(index_path, rewritten)?;
-    }
-    Ok(())
-}
-
-fn renamed_theme_id<'a>(theme_id: &'a str, renamed: &'a [(String, String)]) -> Option<&'a str> {
-    renamed
-        .iter()
-        .find(|(original, _)| original == theme_id)
-        .map(|(_, replacement)| replacement.as_str())
-}
-
-fn validate_extracted_tree(
-    archive_root: &Path,
-    directory: &Path,
-    depth: usize,
-    entry_count: &mut usize,
-    extracted_bytes: &mut u64,
-) -> io::Result<()> {
-    if depth > 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The archive folder nesting is too deep",
-        ));
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        *entry_count += 1;
-        if *entry_count > 100_000 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "The archive contains too many files",
-            ));
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            validate_safe_symlink(&entry.path(), archive_root)?;
-        }
-        if file_type.is_dir() {
-            validate_extracted_tree(
-                archive_root,
-                &entry.path(),
-                depth + 1,
-                entry_count,
-                extracted_bytes,
-            )?;
-        } else if file_type.is_file() {
-            *extracted_bytes += entry.metadata()?.len();
-            if *extracted_bytes > 1024 * 1024 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "The extracted archive exceeds 1 GiB",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_safe_symlink(path: &Path, allowed_root: &Path) -> io::Result<PathBuf> {
-    let target = fs::read_link(path)?;
-    if target.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The archive contains an absolute symbolic link",
-        ));
-    }
-    match fs::canonicalize(path) {
-        Ok(resolved_target) if resolved_target.starts_with(allowed_root) => {}
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "The archive contains a symbolic link that points outside its theme folder",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            validate_broken_internal_symlink(path, &target, allowed_root)?;
-        }
-        Err(error) => return Err(error),
-    }
-    Ok(target)
-}
-
-fn validate_broken_internal_symlink(
-    path: &Path,
-    target: &Path,
-    allowed_root: &Path,
-) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The symbolic link has no parent",
-        )
-    })?;
-    let relative_parent = parent.strip_prefix(allowed_root).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The symbolic link is outside its allowed theme directory",
-        )
-    })?;
-    let mut relative_target = PathBuf::new();
-    for component in relative_parent.components().chain(target.components()) {
-        match component {
-            std::path::Component::Normal(part) => relative_target.push(part),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if relative_target.pop() => {}
-            std::path::Component::ParentDir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "The archive contains a symbolic link that points outside its theme folder",
-                ));
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "The archive contains an absolute symbolic link",
-                ));
-            }
-        }
-    }
-
-    let mut ancestor = allowed_root.join(relative_target);
-    loop {
-        match fs::symlink_metadata(&ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let resolved = fs::canonicalize(&ancestor).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("The broken link traverses an unresolved symbolic link: {error}"),
-                    )
-                })?;
-                if !resolved.starts_with(allowed_root) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "The archive contains a symbolic link that points outside its theme folder",
-                    ));
-                }
-                return Ok(());
-            }
-            Ok(_) => {
-                let resolved = fs::canonicalize(&ancestor)?;
-                if !resolved.starts_with(allowed_root) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "The archive contains a symbolic link that points outside its theme folder",
-                    ));
-                }
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && ancestor != allowed_root => {
-                if !ancestor.pop() {
-                    break;
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn find_theme_directories(
-    directory: &Path,
-    theme_type: &str,
-    depth: usize,
-    candidates: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    if depth > 12 {
-        return Ok(());
-    }
-    if is_valid_theme_directory(directory, theme_type)? {
-        candidates.push(directory.to_path_buf());
-        return Ok(());
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            find_theme_directories(&entry.path(), theme_type, depth + 1, candidates)?;
-        }
-    }
-    Ok(())
-}
-
-fn is_valid_theme_directory(directory: &Path, theme_type: &str) -> io::Result<bool> {
-    let index_path = directory.join("index.theme");
-    let index_metadata = match fs::symlink_metadata(&index_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if index_metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The theme index is a symbolic link",
-        ));
-    }
-    if !index_metadata.is_file() {
-        return Ok(false);
-    }
-    let contents = fs::read_to_string(index_path)?;
-    if read_ini_value(&contents, "Icon Theme", "Name").is_none_or(|name| name.trim().is_empty()) {
-        return Ok(false);
-    }
-    if theme_type == "cursors" {
-        let cursor_directory = directory.join("cursors");
-        if !cursor_directory.is_dir()
-            || fs::symlink_metadata(&cursor_directory)?
-                .file_type()
-                .is_symlink()
-        {
-            return Ok(false);
-        }
-        let canonical_theme = fs::canonicalize(directory)?;
-        for entry in cursor_directory.read_dir()? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_file() {
-                return Ok(true);
-            }
-            if kind.is_symlink() {
-                validate_safe_symlink(&entry.path(), &canonical_theme)?;
-                match fs::canonicalize(entry.path()) {
-                    Ok(target) if target.starts_with(&canonical_theme) && target.is_file() => {
-                        return Ok(true);
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        return Ok(false);
-    }
-
-    let directories = read_ini_value(&contents, "Icon Theme", "Directories")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(safe_relative_path)
-        .any(|relative| {
-            let path = directory.join(relative);
-            path.is_dir()
-                && fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-        });
-    Ok(directories)
-}
-
-fn safe_relative_path(value: &str) -> Option<PathBuf> {
-    let path = Path::new(value.trim());
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(path.to_path_buf())
-}
-
-fn safe_theme_id(value: &str) -> Option<String> {
-    let safe = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let safe = safe.trim_matches(['-', '.']);
-    (!safe.is_empty() && safe.len() <= 128).then(|| safe.to_string())
-}
-
-fn archive_theme_id(archive: &Path) -> Option<String> {
-    let filename = archive.file_name()?.to_string_lossy();
-    let mut stem = filename.to_string();
-    for suffix in [
-        ".tar.gz",
-        ".tar.xz",
-        ".tar.bz",
-        ".tar.bz2",
-        ".tar.lz",
-        ".tar.lzma",
-        ".tar.zst",
-        ".tgz",
-        ".txz",
-        ".tbz2",
-        ".tlz",
-        ".tzst",
-    ] {
-        if stem.to_ascii_lowercase().ends_with(suffix) {
-            stem.truncate(stem.len() - suffix.len());
-            break;
-        }
-    }
-    if stem == filename {
-        stem = archive.file_stem()?.to_string_lossy().to_string();
-    }
-    safe_theme_id(&stem)
-}
-
-fn copy_theme_tree(source: &Path, destination: &Path, theme_root: &Path) -> io::Result<()> {
-    fs::create_dir(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_theme_tree(&entry.path(), &target, theme_root)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), target)?;
-        } else if file_type.is_symlink() {
-            let link_target = validate_safe_symlink(&entry.path(), theme_root)?;
-            match fs::canonicalize(entry.path()) {
-                Ok(_) => symlink(link_target, target)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "The theme contains unsupported filesystem entries",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn make_hidden_theme_selectable(theme_root: &Path, folder_name: &str) -> io::Result<bool> {
-    let index_path = theme_root.join("index.theme");
-    let contents = fs::read_to_string(&index_path)?;
-    if !read_ini_value(&contents, "Icon Theme", "Hidden")
-        .is_some_and(|hidden| hidden.eq_ignore_ascii_case("true"))
-    {
-        return Ok(false);
-    }
-    let mut group = String::new();
-    let mut updated = String::with_capacity(contents.len());
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            group = trimmed[1..trimmed.len() - 1].to_string();
-            updated.push_str(line);
-            updated.push('\n');
-            continue;
-        }
-        if group == "Icon Theme" {
-            if trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "Name")
-            {
-                updated.push_str(&format!("Name={folder_name}\n"));
-                continue;
-            }
-            if trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "Hidden")
-            {
-                updated.push_str("Hidden=false\n");
-                continue;
-            }
-        }
-        updated.push_str(line);
-        updated.push('\n');
-    }
-    fs::write(index_path, updated)?;
-    Ok(true)
 }
 
 fn user_colors_dir() -> io::Result<PathBuf> {
@@ -1399,6 +1130,14 @@ fn active_accent_color() -> io::Result<Option<String>> {
     )?)
 }
 
+fn inactive_header_color(key: &str) -> io::Result<Option<String>> {
+    read_config_value(
+        &user_config_dir()?.join("kdeglobals"),
+        "Colors:Header][Inactive",
+        key,
+    )
+}
+
 fn notify_appearance_changes(scheme_id: &str, accent: &str, theme_id: &str) -> io::Result<()> {
     notify_kde_setting("kdeglobals", "General", "ColorScheme", scheme_id)?;
     notify_kde_setting("kdeglobals", "General", "AccentColor", &kde_rgb(accent))?;
@@ -1415,31 +1154,37 @@ fn notify_appearance_changes(scheme_id: &str, accent: &str, theme_id: &str) -> i
 }
 
 fn notify_kde_setting(file: &str, group: &str, key: &str, value: &str) -> io::Result<()> {
-    let output = Command::new("kwriteconfig6")
-        .args(["--notify", "--file", file, "--group", group, "--key", key])
-        .arg(value)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "KDE could not notify applications about {file} setting {group}/{key}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
+    write_kde_setting(file, &[group], key, Some(value))
 }
 
 fn delete_kde_setting(file: &str, group: &str, key: &str) -> io::Result<()> {
-    let output = Command::new("kwriteconfig6")
-        .args([
-            "--notify", "--file", file, "--group", group, "--key", key, "--delete",
-        ])
-        .output()?;
+    write_kde_setting(file, &[group], key, None)
+}
+
+fn write_kde_setting(
+    file: &str,
+    groups: &[&str],
+    key: &str,
+    value: Option<&str>,
+) -> io::Result<()> {
+    let mut command = Command::new("kwriteconfig6");
+    command.args(["--notify", "--file", file]);
+    for group in groups {
+        command.args(["--group", group]);
+    }
+    command.args(["--key", key]);
+    if let Some(value) = value {
+        command.arg(value);
+    } else {
+        command.arg("--delete");
+    }
+    let output = command.output()?;
     if output.status.success() {
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "KDE could not clear {file} setting {group}/{key}: {}",
+            "KDE could not update {file} setting {}/{key}: {}",
+            groups.join("/"),
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
@@ -1495,17 +1240,80 @@ fn apply_inactive_header_colors(palette: &Palette) -> io::Result<()> {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let actual = read_config_value(
-            &user_config_dir()?.join("kdeglobals"),
-            "Colors:Header][Inactive",
-            key,
-        )?
-        .unwrap_or_default();
+        let actual = inactive_header_color(key)?.unwrap_or_default();
         if actual != value {
             return Err(io::Error::other(format!(
                 "KDE reported success, but inactive header color {key} is {actual}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn restore_appearance_settings(
+    state: Option<&UserState>,
+    owned_schemes: &[PathBuf],
+) -> io::Result<()> {
+    if let Some(state) = state.filter(|state| state.appearance_settings_captured) {
+        write_kde_setting(
+            "kdeglobals",
+            &["General"],
+            "AccentColor",
+            state.previous_accent_color.as_deref(),
+        )?;
+        write_kde_setting(
+            "kdeglobals",
+            &["Colors:Header", "Inactive"],
+            "BackgroundNormal",
+            state.previous_inactive_header_background.as_deref(),
+        )?;
+        write_kde_setting(
+            "kdeglobals",
+            &["Colors:Header", "Inactive"],
+            "BackgroundAlternate",
+            state.previous_inactive_header_alternate.as_deref(),
+        )?;
+        return Ok(());
+    }
+
+    let accent = active_accent_color()?;
+    let inactive_normal = inactive_header_color("BackgroundNormal")?;
+    let inactive_alternate = inactive_header_color("BackgroundAlternate")?;
+    let mut clear_accent = false;
+    let mut clear_inactive_normal = false;
+    let mut clear_inactive_alternate = false;
+    for scheme in owned_schemes {
+        let contents = fs::read_to_string(scheme)?;
+        clear_accent |= accent.as_ref().is_some_and(|value| {
+            read_ini_value(&contents, "Colors:Header", "ForegroundActive").as_ref() == Some(value)
+        });
+        clear_inactive_normal |= inactive_normal.as_ref().is_some_and(|value| {
+            read_ini_value(&contents, "Colors:Header][Inactive", "BackgroundNormal").as_ref()
+                == Some(value)
+        });
+        clear_inactive_alternate |= inactive_alternate.as_ref().is_some_and(|value| {
+            read_ini_value(&contents, "Colors:Header][Inactive", "BackgroundAlternate").as_ref()
+                == Some(value)
+        });
+    }
+    if clear_accent {
+        delete_kde_setting("kdeglobals", "General", "AccentColor")?;
+    }
+    if clear_inactive_normal {
+        write_kde_setting(
+            "kdeglobals",
+            &["Colors:Header", "Inactive"],
+            "BackgroundNormal",
+            None,
+        )?;
+    }
+    if clear_inactive_alternate {
+        write_kde_setting(
+            "kdeglobals",
+            &["Colors:Header", "Inactive"],
+            "BackgroundAlternate",
+            None,
+        )?;
     }
     Ok(())
 }
@@ -1528,11 +1336,53 @@ fn verify_active_inactive_header_colors(scheme_id: &str) -> io::Result<()> {
 }
 
 fn active_desktop_theme() -> io::Result<Option<String>> {
-    Ok(read_config_value(
-        &user_config_dir()?.join("plasmarc"),
-        "Theme",
-        "name",
-    )?)
+    let config_dir = user_config_dir()?;
+    if let Some(theme) = read_config_value(&config_dir.join("plasmarc"), "Theme", "name")?
+        .filter(|theme| !theme.is_empty())
+    {
+        return Ok(Some(theme));
+    }
+
+    let Some(look_and_feel_package) =
+        read_config_value(&config_dir.join("kdeglobals"), "KDE", "LookAndFeelPackage")?
+            .filter(|package| !package.is_empty())
+    else {
+        return Ok(None);
+    };
+    for data_dir in plasma_data_dirs() {
+        let defaults_path = data_dir
+            .join("plasma/look-and-feel")
+            .join(&look_and_feel_package)
+            .join("contents/defaults");
+        let defaults = match fs::read_to_string(defaults_path) {
+            Ok(defaults) => defaults,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(theme) = read_kde_defaults_value(&defaults, "plasmarc", "Theme", "name")
+            .filter(|theme| !theme.is_empty())
+        {
+            return Ok(Some(theme));
+        }
+    }
+    Ok(None)
+}
+
+fn read_kde_defaults_value(contents: &str, file: &str, group: &str, key: &str) -> Option<String> {
+    let target_group = format!("[{file}][{group}]");
+    let mut in_group = false;
+    for line in contents.lines().map(str::trim) {
+        if line.starts_with('[') && line.ends_with(']') {
+            in_group = line == target_group;
+        } else if in_group {
+            if let Some((name, value)) = line.split_once('=') {
+                if name.trim() == key {
+                    return Some(value.trim().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn plasma_data_dirs() -> Vec<PathBuf> {
@@ -1593,19 +1443,7 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-fn create_palettes(path: &Path) -> Result<Vec<Palette>, Box<dyn std::error::Error>> {
-    let image = ImageReader::open(path)?.with_guessed_format()?.decode()?;
-    let sample = image.thumbnail(320, 320).to_rgba8();
-    let colors = estimate_wallpaper_colors(&sample);
-    Ok(colors
-        .into_iter()
-        .enumerate()
-        .map(|(index, (hue, saturation, lightness, region_hue))| {
-            palette_from_color(index, hue, saturation, lightness, region_hue)
-        })
-        .collect())
-}
-
+// Convert sampled wallpaper colors into palettes with readable foreground colors.
 fn palette_from_color(
     index: usize,
     hue: f64,
@@ -1829,6 +1667,7 @@ fn circular_hue_distance(left: f64, right: f64) -> f64 {
     difference.min(360.0 - difference)
 }
 
+// Generate and activate a Plasma theme and color scheme for the selected palette.
 fn apply_palette(palette: &Palette) -> Result<(), Box<dyn std::error::Error>> {
     let colors_dir = user_colors_dir()?;
     fs::create_dir_all(&colors_dir)?;
@@ -1894,6 +1733,10 @@ fn get_or_create_state() -> io::Result<(UserState, bool)> {
         UserState {
             previous_color_scheme,
             previous_desktop_theme: active_desktop_theme()?,
+            previous_accent_color: active_accent_color()?,
+            previous_inactive_header_background: inactive_header_color("BackgroundNormal")?,
+            previous_inactive_header_alternate: inactive_header_color("BackgroundAlternate")?,
+            appearance_settings_captured: true,
         },
         true,
     ))
@@ -2113,6 +1956,7 @@ fn verify_generated_theme(path: &Path) -> io::Result<()> {
     }
 }
 
+// Restore prior appearance settings and remove only themes/schemes owned by PCP.
 fn remove_user_state() -> io::Result<()> {
     let path = user_state_path()?;
     match fs::remove_file(path) {
@@ -2156,6 +2000,12 @@ fn remove_owned_palettes() -> Result<RemoveResult, Box<dyn std::error::Error>> {
     let state = read_user_state()?;
     let active_scheme = active_color_scheme()?.unwrap_or_default();
     let active_theme = active_desktop_theme()?.unwrap_or_default();
+    let active_widget_appearance = is_generated_theme_id(&active_theme)
+        || owned_files.iter().any(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|id| id == active_scheme)
+        });
 
     if owned_files.iter().any(|path| {
         path.file_stem()
@@ -2177,6 +2027,9 @@ fn remove_owned_palettes() -> Result<RemoveResult, Box<dyn std::error::Error>> {
             .and_then(|state| state.previous_desktop_theme.as_deref())
             .ok_or_else(|| io::Error::other("Cannot restore the previous Plasma theme"))?;
         activate_desktop_theme(original_theme)?;
+    }
+    if active_widget_appearance {
+        restore_appearance_settings(state.as_ref(), &owned_files)?;
     }
     let removed_theme = remove_obsolete_generated_themes(None)?;
 
@@ -2229,6 +2082,7 @@ fn remove_obsolete_generated_themes(active_theme: Option<&str>) -> io::Result<bo
     Ok(removed)
 }
 
+// Read, create, and apply KDE color-scheme files; includes color conversion helpers.
 fn is_owned_scheme_file(path: &Path) -> bool {
     if path.extension().and_then(|ext| ext.to_str()) != Some("colors") {
         return false;
@@ -2524,505 +2378,4 @@ fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> (f64, f64, f64) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "wallpaper-palette-{label}-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create temporary directory");
-        path
-    }
-
-    #[test]
-    fn invalid_xdg_user_directory_uses_home_fallback() {
-        let home = PathBuf::from("/home/test-user");
-
-        assert_eq!(
-            resolve_xdg_user_dir(Some(PathBuf::new()), Some(home.clone()), ".local/share").unwrap(),
-            home.join(".local/share")
-        );
-        assert_eq!(
-            resolve_xdg_user_dir(
-                Some(PathBuf::from("relative/path")),
-                Some(home.clone()),
-                ".config"
-            )
-            .unwrap(),
-            home.join(".config")
-        );
-        assert_eq!(
-            resolve_xdg_user_dir(
-                Some(PathBuf::from("/custom/data")),
-                Some(home),
-                ".local/share"
-            )
-            .unwrap(),
-            PathBuf::from("/custom/data")
-        );
-    }
-
-    fn test_palette() -> Palette {
-        Palette {
-            index: 0,
-            name: "Wallpaper Palette 01".to_string(),
-            panel: "#0B1520".to_string(),
-            background: "#101820".to_string(),
-            surface: "#18232C".to_string(),
-            accent: "#56A6D8".to_string(),
-            selection: "#236A98".to_string(),
-            foreground: "#F4F4F5".to_string(),
-            selection_foreground: "#FFFFFF".to_string(),
-        }
-    }
-
-    #[test]
-    fn extracts_three_distinct_dominant_hues_from_wallpaper() {
-        let sample = RgbaImage::from_fn(90, 30, |x, _| match x / 30 {
-            0 => image::Rgba([240, 40, 30, 255]),
-            1 => image::Rgba([245, 210, 30, 255]),
-            _ => image::Rgba([220, 40, 130, 255]),
-        });
-
-        let colors = estimate_wallpaper_colors(&sample);
-        assert_eq!(colors.len(), 3);
-        for expected_hue in [0.0, 55.0, 330.0] {
-            assert!(
-                colors
-                    .iter()
-                    .any(|(hue, _, _, _)| circular_hue_distance(*hue, expected_hue) < 20.0),
-                "missing hue near {expected_hue}: {colors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn ignores_black_majority_when_estimating_wallpaper_colors() {
-        let sample = RgbaImage::from_fn(100, 10, |x, _| {
-            if x < 70 {
-                image::Rgba([0, 0, 0, 255])
-            } else {
-                image::Rgba([16, 46, 84, 255])
-            }
-        });
-
-        let colors = estimate_wallpaper_colors(&sample);
-        assert_eq!(colors.len(), 3);
-        assert!(
-            colors.iter().any(|(hue, saturation, _, _)| {
-                (200.0..230.0).contains(hue) && *saturation > 0.4
-            }),
-            "blue hue missing: {colors:?}"
-        );
-    }
-
-    #[test]
-    fn neutral_wallpaper_uses_stable_blue_fallback() {
-        let sample = RgbaImage::from_pixel(8, 8, image::Rgba([12, 12, 12, 255]));
-        let colors = estimate_wallpaper_colors(&sample);
-        assert_eq!(colors.len(), 3);
-        assert!(circular_hue_distance(colors[0].0, 220.0) < 5.0);
-        assert!((colors[0].1 - 0.35).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn preserves_dark_navy_wallpaper_shade_in_generated_background() {
-        let sample = RgbaImage::from_pixel(32, 32, image::Rgba([10, 28, 48, 255]));
-        let colors = estimate_wallpaper_colors(&sample);
-        let (hue, saturation, lightness, region_hue) = colors[0];
-        let palette = palette_from_color(0, hue, saturation, lightness, region_hue);
-        let value = u32::from_str_radix(&palette.background[1..], 16).unwrap();
-        let rgb = (
-            f64::from((value >> 16) & 0xff) / 255.0,
-            f64::from((value >> 8) & 0xff) / 255.0,
-            f64::from(value & 0xff) / 255.0,
-        );
-        let (background_hue, background_saturation, background_lightness) =
-            rgb_to_hsl(rgb.0, rgb.1, rgb.2);
-
-        assert!(circular_hue_distance(background_hue, 210.0) < 10.0);
-        assert!(background_saturation > 0.16);
-        assert!((0.12..0.20).contains(&background_lightness));
-    }
-
-    #[test]
-    fn samples_a_matching_hue_from_wallpaper_edges() {
-        let sample = RgbaImage::from_fn(20, 20, |_, y| {
-            if y < 10 {
-                image::Rgba([220, 40, 130, 255])
-            } else {
-                image::Rgba([16, 46, 84, 255])
-            }
-        });
-        let edge_hue = strongest_edge_hue(&sample, 220.0).unwrap();
-        assert!(circular_hue_distance(edge_hue, 220.0) < 10.0);
-    }
-
-    #[test]
-    fn recolors_panel_svg_gradient_stops() {
-        let svg = r#"<linearGradient><stop style="stop-color:#AA0000;stop-opacity:1"/><stop style="stop-color:#550000"/></linearGradient>"#;
-        let recolored = recolor_panel_svg(svg, "#12AB34", "#050607").unwrap();
-        assert!(recolored.contains("stop-color:#12AB34"));
-        assert!(recolored.contains("stop-color:#050607"));
-        assert!(!recolored.contains("#AA0000"));
-    }
-
-    #[test]
-    fn recognizes_only_widget_owned_legacy_scheme_files() {
-        let directory = temp_dir("scheme-owner");
-        let owned = directory.join("WallpaperPalette02-3.colors");
-        fs::write(
-            &owned,
-            "[General]\nName=Wallpaper Palette 02 (3)\n[Colors:View]\n",
-        )
-        .unwrap();
-        let unrelated = directory.join("WallpaperPalette02-4.colors");
-        fs::write(&unrelated, "[General]\nName=My custom palette\n").unwrap();
-        let marked = directory.join("AnyName.colors");
-        fs::write(
-            &marked,
-            format!("[General]\nX-WallpaperPalette-Owner={LEGACY_WIDGET_OWNER_MARKER}\n"),
-        )
-        .unwrap();
-        let current = directory.join("PlasmaColorPicker03-2.colors");
-        fs::write(&current, "[General]\nName=PlasmaColorPicker 03 (2)\n").unwrap();
-        let current_marker = directory.join("MarkedByPcp.colors");
-        fs::write(
-            &current_marker,
-            format!("[General]\nX-WallpaperPalette-Owner={WIDGET_OWNER_MARKER}\n"),
-        )
-        .unwrap();
-
-        assert!(is_owned_scheme_file(&owned));
-        assert!(!is_owned_scheme_file(&unrelated));
-        assert!(is_owned_scheme_file(&marked));
-        assert!(is_owned_scheme_file(&current));
-        assert!(is_owned_scheme_file(&current_marker));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn writes_full_kde_scheme_roles_and_widget_marker() {
-        let contents = colors_file("Test Palette", &test_palette());
-        for group in [
-            "[Colors:Window]",
-            "[Colors:Button]",
-            "[Colors:View]",
-            "[Colors:Tooltip]",
-            "[Colors:Complementary]",
-            "[Colors:Header]",
-            "[Colors:Header][Inactive]",
-            "[Colors:Selection]",
-            "[ColorEffects:Disabled]",
-            "[ColorEffects:Inactive]",
-            "[WM]",
-        ] {
-            assert!(contents.contains(group), "Missing {group}");
-        }
-        assert!(contents.contains(&format!(
-            "[Colors:Header][Inactive]\nBackgroundNormal={}\nBackgroundAlternate={}\n",
-            kde_rgb(&test_palette().panel),
-            kde_rgb(&test_palette().background)
-        )));
-        assert!(contents.contains(&format!(
-            "BackgroundNormal={}",
-            kde_rgb(&test_palette().panel)
-        )));
-        assert!(contents.contains(&format!("X-WallpaperPalette-Owner={WIDGET_OWNER_MARKER}")));
-    }
-
-    #[test]
-    fn emits_plasma_theme_color_roles() {
-        let contents = plasma_theme_colors(&test_palette());
-        for group in [
-            "[Background:Normal]",
-            "[Background:Window]",
-            "[Foreground:Normal]",
-            "[Colors:Button]",
-            "[Colors:Selection]",
-            "[Colors:View]",
-            "[Colors:Window]",
-            "[Colors:Header]",
-            "[Colors:Complementary]",
-            "[Colors:Tooltip]",
-        ] {
-            assert!(contents.contains(group), "Missing {group}");
-        }
-        assert!(contents.contains("FocusColor=86,166,216"));
-    }
-
-    #[test]
-    fn decodes_local_file_urls() {
-        assert_eq!(
-            local_file_path("file:///home/test/My%20Wallpaper.png"),
-            Some(PathBuf::from("/home/test/My Wallpaper.png"))
-        );
-        assert_eq!(local_file_path("https://example.test/image.png"), None);
-    }
-
-    #[test]
-    fn validates_icon_and_cursor_theme_archives() {
-        let directory = temp_dir("theme-validation");
-        let icon_theme = directory.join("icons");
-        fs::create_dir_all(icon_theme.join("16x16/apps")).unwrap();
-        fs::write(
-            icon_theme.join("index.theme"),
-            "[Icon Theme]\nName=Test Icons\nDirectories=16x16/apps\n",
-        )
-        .unwrap();
-        assert!(is_valid_theme_directory(&icon_theme, "icons").unwrap());
-        assert!(!is_valid_theme_directory(&icon_theme, "cursors").unwrap());
-
-        let cursor_theme = directory.join("cursors-theme");
-        fs::create_dir_all(cursor_theme.join("cursors")).unwrap();
-        fs::write(
-            cursor_theme.join("index.theme"),
-            "[Icon Theme]\nName=Test Cursor\n",
-        )
-        .unwrap();
-        fs::write(cursor_theme.join("cursors/default"), b"cursor").unwrap();
-        assert!(is_valid_theme_directory(&cursor_theme, "cursors").unwrap());
-        assert!(!is_valid_theme_directory(&cursor_theme, "icons").unwrap());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn recognizes_cursor_themes_whose_cursor_names_are_internal_symlinks() {
-        let directory = temp_dir("cursor-symlink-validation");
-        let cursor_theme = directory.join("cursor-theme");
-        fs::create_dir_all(cursor_theme.join("cursors")).unwrap();
-        fs::create_dir_all(cursor_theme.join("cursor-data")).unwrap();
-        fs::write(cursor_theme.join("cursor-data/default"), b"cursor").unwrap();
-        fs::write(
-            cursor_theme.join("index.theme"),
-            "[Icon Theme]\nName=Linked Cursor Theme\n",
-        )
-        .unwrap();
-        symlink(
-            "../cursor-data/default",
-            cursor_theme.join("cursors/default"),
-        )
-        .unwrap();
-
-        assert!(is_valid_theme_directory(&cursor_theme, "cursors").unwrap());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn installs_cursors_in_the_xcursor_user_directory() {
-        let data_home = Path::new("/home/test/.local/share");
-        let home = Path::new("/home/test");
-        assert_eq!(
-            theme_install_directory_for("icons", data_home, home).unwrap(),
-            PathBuf::from("/home/test/.local/share/icons")
-        );
-        assert_eq!(
-            theme_install_directory_for("cursors", data_home, home).unwrap(),
-            PathBuf::from("/home/test/.icons")
-        );
-        assert!(theme_install_directory_for("themes", data_home, home).is_err());
-    }
-
-    #[test]
-    fn detects_tar_layers_by_header_even_without_a_tar_extension() {
-        let directory = temp_dir("tar-magic-detection");
-        let payload = directory.join("extensionless-payload");
-        let mut header = [0u8; 512];
-        header[..4].copy_from_slice(b"test");
-        header[100..108].copy_from_slice(b"0000644\0");
-        header[108..116].copy_from_slice(b"0000000\0");
-        header[116..124].copy_from_slice(b"0000000\0");
-        header[124..136].copy_from_slice(b"00000000000\0");
-        header[136..148].copy_from_slice(b"00000000000\0");
-        header[148..156].fill(b' ');
-        header[156] = b'0';
-        header[257..263].copy_from_slice(b"ustar\0");
-        let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
-        let checksum_field = format!("{checksum:06o}\0 ");
-        header[148..156].copy_from_slice(checksum_field.as_bytes());
-        fs::write(&payload, header).unwrap();
-        assert!(is_tar_archive(&payload).unwrap());
-        assert_eq!(find_inner_tar(&directory).unwrap(), Some(payload.clone()));
-
-        fs::write(&payload, b"not a tar archive").unwrap();
-        assert!(!is_tar_archive(&payload).unwrap());
-        assert_eq!(find_inner_tar(&directory).unwrap(), None);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn allows_internal_theme_symlinks_and_rejects_external_targets() {
-        let directory = temp_dir("theme-symlinks");
-        let theme = directory.join("theme");
-        fs::create_dir_all(theme.join("cursors")).unwrap();
-        fs::write(theme.join("cursors/default"), b"cursor").unwrap();
-        symlink("default", theme.join("cursors/left_ptr")).unwrap();
-
-        let canonical_root = fs::canonicalize(&directory).unwrap();
-        let link_target =
-            validate_safe_symlink(&theme.join("cursors/left_ptr"), &canonical_root).unwrap();
-        assert_eq!(link_target, PathBuf::from("default"));
-
-        let copied = directory.join("copied");
-        let canonical_theme = fs::canonicalize(&theme).unwrap();
-        copy_theme_tree(&theme, &copied, &canonical_theme).unwrap();
-        assert_eq!(
-            fs::read_link(copied.join("cursors/left_ptr")).unwrap(),
-            PathBuf::from("default")
-        );
-
-        symlink("missing-cursor", theme.join("cursors/unused-alias")).unwrap();
-        assert!(
-            validate_safe_symlink(&theme.join("cursors/unused-alias"), &canonical_theme).is_ok()
-        );
-        copy_theme_tree(
-            &theme,
-            &directory.join("copied-with-broken-alias"),
-            &canonical_theme,
-        )
-        .unwrap();
-        assert!(!directory
-            .join("copied-with-broken-alias/cursors/unused-alias")
-            .exists());
-
-        let outside = directory.join("outside");
-        fs::write(&outside, b"outside").unwrap();
-        symlink("../../outside", theme.join("cursors/escape")).unwrap();
-        assert!(validate_safe_symlink(&theme.join("cursors/escape"), &canonical_theme).is_err());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn assigns_a_non_conflicting_theme_folder_name() {
-        let directory = temp_dir("theme-name-conflict");
-        fs::create_dir(directory.join("Kora-Yellow")).unwrap();
-        assert_eq!(
-            unique_theme_folder_name("Kora-Yellow", &[directory.clone()], &[]).unwrap(),
-            "Kora-Yellow-PCP"
-        );
-        assert_eq!(
-            unique_theme_folder_name(
-                "Kora-Yellow",
-                &[directory.clone()],
-                &["Kora-Yellow-PCP".to_string()]
-            )
-            .unwrap(),
-            "Kora-Yellow-PCP-2"
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rewrites_theme_inheritance_when_a_folder_name_changes() {
-        let directory = temp_dir("theme-id-rewrite");
-        fs::write(
-            directory.join("index.theme"),
-            "[Icon Theme]\nName=Kora\nInherits=hicolor,Another\n",
-        )
-        .unwrap();
-        rewrite_theme_index_for_install(
-            &directory,
-            "Kora",
-            "Kora-PCP",
-            &[("Another".to_string(), "Another-PCP".to_string())],
-        )
-        .unwrap();
-        let contents = fs::read_to_string(directory.join("index.theme")).unwrap();
-        assert!(contents.contains("Name=Kora (PCP)"));
-        assert!(contents.contains("Inherits=hicolor,Another-PCP"));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn exposes_single_hidden_theme_when_staging_it() {
-        let directory = temp_dir("hidden-theme");
-        fs::write(
-            directory.join("index.theme"),
-            "[Icon Theme]\nName=Adwaita\nHidden=true\nDirectories=16x16/apps\n\n[16x16/apps]\nSize=16\n",
-        )
-        .unwrap();
-        assert!(make_hidden_theme_selectable(&directory, "Mojito").unwrap());
-        let contents = fs::read_to_string(directory.join("index.theme")).unwrap();
-        assert!(contents.contains("Name=Mojito"));
-        assert!(contents.contains("Hidden=false"));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rejects_unsafe_theme_directory_entries() {
-        assert!(safe_relative_path("16x16/apps").is_some());
-        assert!(safe_relative_path("../outside").is_none());
-        assert!(safe_relative_path("/absolute/path").is_none());
-        assert_eq!(
-            safe_theme_id("../Test theme"),
-            Some("Test-theme".to_string())
-        );
-        assert_eq!(
-            archive_theme_id(Path::new("/tmp/Mojito.tar.zst")),
-            Some("Mojito".to_string())
-        );
-    }
-
-    #[test]
-    fn selects_readable_text_for_selection_backgrounds() {
-        assert_eq!(contrast_foreground((0.05, 0.08, 0.1)), "#FFFFFF");
-        assert_eq!(contrast_foreground((0.9, 0.9, 0.9)), "#000000");
-    }
-
-    #[test]
-    fn maps_palette_accent_to_kde_store_search_color() {
-        assert_eq!(hue_search_term("#D93B38").unwrap(), "red");
-        assert_eq!(hue_search_term("#4C88BB").unwrap(), "blue");
-        assert_eq!(hue_search_term("#D62A94").unwrap(), "pink");
-        assert_eq!(hue_search_term("#DEB352").unwrap(), "yellow");
-        assert_eq!(hue_search_term("#DF8657").unwrap(), "orange");
-        assert_eq!(hue_search_term("#E8C547").unwrap(), "yellow");
-        assert!(hue_search_term("blue").is_err());
-    }
-
-    #[test]
-    fn assigns_distinct_names_to_repeated_saves() {
-        assert_eq!(
-            scheme_display_name("WallpaperPalette02", 1),
-            "Wallpaper Palette 02"
-        );
-        assert_eq!(
-            scheme_display_name("WallpaperPalette02-3", 1),
-            "Wallpaper Palette 02 (3)"
-        );
-        assert_eq!(
-            scheme_display_name("PlasmaColorPicker02", 1),
-            "PlasmaColorPicker 02"
-        );
-        assert_eq!(
-            scheme_display_name("PlasmaColorPicker02-3", 1),
-            "PlasmaColorPicker 02 (3)"
-        );
-    }
-
-    #[test]
-    fn generates_a_new_theme_id_for_each_saved_palette() {
-        let first = generated_theme_id_for_scheme("PlasmaColorPicker02");
-        let second = generated_theme_id_for_scheme("PlasmaColorPicker03-2");
-
-        assert!(is_generated_theme_id(&first));
-        assert!(is_generated_theme_id(&second));
-        assert_ne!(first, second);
-        assert_eq!(generated_theme_id_for_scheme("PlasmaColorPicker02"), first);
-    }
-
-    #[test]
-    fn writes_required_kde_color_groups() {
-        let contents = colors_file("PlasmaColorPicker 01", &test_palette());
-        assert!(contents.contains("[Colors:Window]"));
-        assert!(contents.contains("[Colors:Selection]"));
-        assert!(contents.contains("[WM]"));
-    }
-}
+mod tests;

@@ -1,3 +1,4 @@
+// Shared icon/cursor search panel with palette selection and KDE Store results.
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
@@ -10,6 +11,8 @@ ColumnLayout {
     property bool hasPalettes: false
     property var themes: []
     property string statusText: ""
+    property bool statusIsError: false
+    property string storeSearchUrl: ""
     property bool busy: false
     property bool searching: false
     property int searchElapsedSeconds: 0
@@ -17,6 +20,7 @@ ColumnLayout {
 
     signal searchRequested(int paletteIndex)
     signal openStoreItem(string url)
+    signal openStoreSearch(string url)
 
     SystemPalette {
         id: systemPalette
@@ -76,9 +80,24 @@ ColumnLayout {
 
     QQC2.Label {
         Layout.fillWidth: true
-        visible: root.statusText.length > 0
+        visible: root.statusText.length > 0 && !root.statusIsError
         text: root.statusText
         wrapMode: Text.Wrap
+    }
+
+    CopyableText {
+        Layout.fillWidth: true
+        visible: root.statusText.length > 0 && root.statusIsError
+        text: root.statusText
+        copyButtonText: root.text("Copy error", "Копировать ошибку")
+        maximumHeight: 120
+    }
+
+    QQC2.Button {
+        Layout.alignment: Qt.AlignLeft
+        visible: root.storeSearchUrl.length > 0
+        text: root.text("Search KDE Store directly", "Открыть поиск в KDE Store")
+        onClicked: root.openStoreSearch(root.storeSearchUrl)
     }
 
     QQC2.Button {
@@ -112,7 +131,7 @@ ColumnLayout {
         delegate: Rectangle {
             required property var modelData
             width: themeList.width
-            height: 110
+            height: 190
             radius: 8
             color: systemPalette.alternateBase
 
@@ -134,14 +153,11 @@ ColumnLayout {
                     font.pointSize: 9
                 }
 
-                QQC2.Label {
+                CopyableText {
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
                     text: modelData.summary
-                    wrapMode: Text.Wrap
-                    elide: Text.ElideRight
-                    maximumLineCount: 2
-                    font.pointSize: 9
+                    showCopyButton: false
+                    maximumHeight: 58
                 }
 
                 QQC2.Button {
